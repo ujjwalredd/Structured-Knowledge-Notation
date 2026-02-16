@@ -111,7 +111,7 @@ Both pipelines correctly refused all 3 unanswerable questions (samples 11-13). T
 | Metric | JSON | SKN | Ratio |
 |--------|------|-----|-------|
 | Avg context tokens | 686 | 273 | SKN uses **60% fewer tokens** |
-| Token ratio | 1.0x | 0.4x | -- |
+| Token ratio (SKN/JSON) | 1.0x (baseline) | 0.4x | **2.5x compression** |
 
 SKN achieves this compression by replacing verbose JSON keys (`"entities"`, `"relationships"`, `"claims"`) with single-character symbols (`!`, `.`, `~`, `->`) and structured section headers (`@facts`, `@causal`, `@gaps`). The token savings compound at scale: a 1000-query workload would save ~413,000 context tokens.
 
