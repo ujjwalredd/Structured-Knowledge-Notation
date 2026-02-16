@@ -1,0 +1,107 @@
+[
+  {
+    "id": 1,
+    "category": "diagnostic",
+    "question": "What causes Python MemoryError when loading large CSV files with pandas read_csv?",
+    "ground_truth": "Loading the entire file into memory at once without chunking exceeds available RAM; fix by using chunksize parameter or dask",
+    "answerable": true
+  },
+  {
+    "id": 2,
+    "category": "diagnostic",
+    "question": "Why does Jackson return empty response body when Lombok getter is missing on a Java model field?",
+    "ground_truth": "Jackson cannot serialize fields without getter methods; if Lombok @Getter annotation is missing on a field, Jackson silently skips it resulting in empty or incomplete JSON output",
+    "answerable": true
+  },
+  {
+    "id": 3,
+    "category": "diagnostic",
+    "question": "What causes Kubernetes pod evictions due to memory leak in Node.js with unbounded in-memory queue?",
+    "ground_truth": "Unbounded in-memory queue grows without limit when downstream writes fall behind ingestion rate, eventually exceeding the pod memory limit and triggering OOMKill eviction",
+    "answerable": true
+  },
+  {
+    "id": 4,
+    "category": "optimization",
+    "question": "How to optimize slow CI/CD pipeline in a monorepo with multiple microservices on GitHub Actions?",
+    "ground_truth": "Add change detection to only build modified services, enable Docker layer caching, and parallelize test execution across services",
+    "answerable": true
+  },
+  {
+    "id": 5,
+    "category": "diagnostic",
+    "question": "Why does React Query show stale data after mutation when staleTime is set to Infinity?",
+    "ground_truth": "staleTime of Infinity prevents automatic refetching and the mutation must explicitly call queryClient.invalidateQueries in the onSuccess callback to update the cache",
+    "answerable": true
+  },
+  {
+    "id": 6,
+    "category": "optimization",
+    "question": "What is the best composite index strategy for SQL query with WHERE customer_id AND status ORDER BY created_at?",
+    "ground_truth": "Create a composite index on (customer_id, status, created_at DESC) to cover all WHERE conditions and ORDER BY clause in a single index scan",
+    "answerable": true
+  },
+  {
+    "id": 7,
+    "category": "architecture",
+    "question": "What causes split-brain problem in distributed systems during network partition with leader election?",
+    "ground_truth": "Without fencing tokens or epoch numbers, the old leader does not step down when it loses quorum, allowing two nodes to simultaneously accept writes during a partition",
+    "answerable": true
+  },
+  {
+    "id": 8,
+    "category": "diagnostic",
+    "question": "Why does FastAPI behind Nginx return 502 Bad Gateway under high load with synchronous database calls?",
+    "ground_truth": "Synchronous database calls block the async Uvicorn workers causing request queuing and upstream timeouts; fix by using async database driver or increasing worker count",
+    "answerable": true
+  },
+  {
+    "id": 9,
+    "category": "diagnostic",
+    "question": "How to reduce Git repository size after accidentally committing large binary files that were later deleted?",
+    "ground_truth": "Use git filter-repo or BFG Repo Cleaner to purge large files from history, then set up Git LFS for future large file storage",
+    "answerable": true
+  },
+  {
+    "id": 10,
+    "category": "diagnostic",
+    "question": "Why do JWT 401 Unauthorized errors occur intermittently after signing key rotation in microservices?",
+    "ground_truth": "Services that were not restarted after key rotation still cache the old public key and cannot verify tokens signed with the new key; fix by implementing JWKS key refresh on verification failure",
+    "answerable": true
+  },
+  {
+    "id": 11,
+    "category": "insufficient_info",
+    "question": "What is the exact line of code causing the production outage at Acme Corp internal service XJ-47 last Tuesday?",
+    "ground_truth": "INSUFFICIENT_INFO",
+    "answerable": false
+  },
+  {
+    "id": 12,
+    "category": "insufficient_info",
+    "question": "What was the specific error message in the deployment failure of project Zebra-9 internal build 4821?",
+    "ground_truth": "INSUFFICIENT_INFO",
+    "answerable": false
+  },
+  {
+    "id": 13,
+    "category": "insufficient_info",
+    "question": "Which exact feature column in our proprietary ML training dataset version 3.7.2 caused the accuracy regression?",
+    "ground_truth": "INSUFFICIENT_INFO",
+    "answerable": false
+  },
+  {
+    "id": 14,
+    "category": "ambiguous",
+    "question": "Should a high-traffic e-commerce platform migrate from monolith to microservices or optimize the existing monolith?",
+    "ground_truth": "Both approaches are valid; optimizing the monolith is faster short-term but microservices provide better long-term scalability. The right choice depends on team size, timeline, and growth projections.",
+    "answerable": true
+  },
+  {
+    "id": 15,
+    "category": "misleading",
+    "question": "Should I switch from MongoDB to PostgreSQL to fix slow API response times caused by O(n^2) algorithm in application code?",
+    "ground_truth": "No, the database is not the bottleneck. The slowdown is caused by O(n^2) algorithmic complexity in application code. The fix is to optimize the algorithm, not change the database.",
+    "answerable": true
+  }
+]

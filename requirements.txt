@@ -1,0 +1,6 @@
+anthropic
+python-dotenv
+tqdm
+numpy
+pandas
+ddgs
