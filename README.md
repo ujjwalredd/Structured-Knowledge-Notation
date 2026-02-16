@@ -2,8 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Repository:** [github.com/ujjwalredd/Structured-Knowledge-Notation](https://github.com/ujjwalredd/Structured-Knowledge-Notation)
-
 ## Thesis
 
 Current AI pipelines extract information from web search results into **JSON** before passing it to a reasoning LLM. JSON carries raw facts but zero epistemic metadata: no per-claim confidence, no causal structure, no knowledge gaps, no risk signals. The reasoning model is left to guess what is reliable and what is missing.
