@@ -1,101 +1,38 @@
 """
-Evaluation metrics for the JSON vs SKN extraction benchmark.
+Evaluation metrics for the SKN benchmark.
 
-Both extraction formats feed into the same agent. This module measures
-five dimensions to determine which intermediate format produces better
-agent reasoning:
-
+Measures six dimensions per extraction format:
 1. Accuracy          Did the agent get the right answer?
 2. Confidence (ECE)  Are confidence scores well-calibrated?
 3. Hallucination     Did the agent fabricate unsupported claims?
 4. Groundedness      Is the answer backed by the source text?
 5. Abstention        Does the agent correctly refuse when info is missing?
+6. Normalized hallucination  fabricated_claims / total_claims
+
+Includes bootstrap confidence intervals for all metrics.
 """
 
 import json
 import logging
-import os
 import re
-import time
 from typing import Any
 
 import numpy as np
-from anthropic import Anthropic, APIError, RateLimitError
-from dotenv import load_dotenv
 
-load_dotenv()
+from src.llm import call_llm
 
 logger = logging.getLogger(__name__)
 
-_client: Anthropic | None = None
-
-
-def _get_client() -> Anthropic:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise EnvironmentError("ANTHROPIC_API_KEY not set.")
-        _client = Anthropic(api_key=api_key)
-    return _client
-
-
-def _call_api(
-    system: str,
-    user_message: str,
-    model: str = "claude-sonnet-4-20250514",
-    max_retries: int = 3,
-    base_delay: float = 2.0,
-) -> str:
-    client = _get_client()
-    for attempt in range(1, max_retries + 1):
-        try:
-            message = client.messages.create(
-                model=model,
-                max_tokens=4096,
-                temperature=0,
-                system=system,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            return message.content[0].text
-        except RateLimitError:
-            wait = base_delay * (2 ** (attempt - 1))
-            logger.warning(
-                "Rate-limited (attempt %d/%d). Retrying in %.1fs",
-                attempt, max_retries, wait,
-            )
-            if attempt == max_retries:
-                raise
-            time.sleep(wait)
-        except APIError as exc:
-            if exc.status_code and exc.status_code >= 500:
-                wait = base_delay * (2 ** (attempt - 1))
-                logger.warning(
-                    "Server error (attempt %d/%d). Retrying in %.1fs",
-                    attempt, max_retries, wait,
-                )
-                if attempt == max_retries:
-                    raise
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("Exhausted retries")
-
 
 def _parse_json_response(raw: str) -> dict[str, Any]:
-    """Extract and parse a JSON object from an LLM response.
-
-    Handles: pure JSON, ```json code blocks, JSON surrounded by text.
-    """
+    """Extract and parse a JSON object from an LLM response."""
     cleaned = raw.strip()
 
-    # 1. Direct parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # 2. Extract from markdown code block anywhere in the text
     code_block = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", cleaned, re.DOTALL)
     if code_block:
         try:
@@ -103,7 +40,6 @@ def _parse_json_response(raw: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # 3. Find first JSON object {...} in the text
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -133,9 +69,16 @@ or
 {"correct": false}"""
 
 
-def _judge_correct(prediction: str, ground_truth: str) -> bool:
+def _judge_correct(
+    prediction: str, ground_truth: str, model: str = "qwen2.5:7b"
+) -> bool:
     user_msg = f"Ground truth: {ground_truth}\n\nPrediction: {prediction}"
-    raw = _call_api(system=ACCURACY_JUDGE_PROMPT, user_message=user_msg)
+    raw = call_llm(
+        system=ACCURACY_JUDGE_PROMPT,
+        user_message=user_msg,
+        model=model,
+        json_mode=True,
+    )
     try:
         result = _parse_json_response(raw).get("correct", False)
         logger.debug("Accuracy judge raw: %s -> %s", raw[:200], result)
@@ -146,13 +89,15 @@ def _judge_correct(prediction: str, ground_truth: str) -> bool:
 
 
 # ===================================================================
-# 2. HALLUCINATION
+# 2. HALLUCINATION (with normalized claim count)
 # ===================================================================
 
 HALLUCINATION_JUDGE_PROMPT = """\
 You are a hallucination detector. Given the ORIGINAL SOURCE TEXT and an ANSWER,
 determine whether the answer contains any claims that are NOT supported by or
 cannot be reasonably inferred from the source text.
+
+Count the TOTAL number of distinct claims in the answer, and list any fabricated ones.
 
 Severity scale:
 0.0 = no hallucination
@@ -161,28 +106,41 @@ Severity scale:
 0.7-1.0 = severe hallucination (contradicts the source or invents wholesale)
 
 Respond with ONLY this JSON object, no other text before or after:
-{"hallucination_detected": true, "hallucination_severity": 0.5, "fabricated_claims": ["claim1"]}"""
+{"hallucination_detected": true, "hallucination_severity": 0.5, "total_claims": 8, "fabricated_claims": ["claim1", "claim2"]}"""
 
 
-def _judge_hallucination(source_text: str, answer: str) -> dict[str, Any]:
+def _judge_hallucination(
+    source_text: str, answer: str, model: str = "qwen2.5:7b"
+) -> dict[str, Any]:
     user_msg = (
         f"ORIGINAL SOURCE TEXT:\n{source_text}\n\n"
         f"ANSWER TO EVALUATE:\n{answer}"
     )
-    raw = _call_api(system=HALLUCINATION_JUDGE_PROMPT, user_message=user_msg)
+    raw = call_llm(
+        system=HALLUCINATION_JUDGE_PROMPT,
+        user_message=user_msg,
+        model=model,
+        json_mode=True,
+    )
     try:
         result = _parse_json_response(raw)
+        fabricated = result.get("fabricated_claims", [])
+        total = max(int(result.get("total_claims", 1)), 1)
         return {
             "hallucination_detected": bool(result.get("hallucination_detected", False)),
             "hallucination_severity": float(result.get("hallucination_severity", 0.0)),
-            "fabricated_claims": result.get("fabricated_claims", []),
+            "total_claims": total,
+            "fabricated_claims": fabricated,
+            "normalized_hallucination": len(fabricated) / total,
         }
     except (json.JSONDecodeError, AttributeError):
         logger.warning("Hallucination judge unparseable")
         return {
             "hallucination_detected": False,
             "hallucination_severity": 0.0,
+            "total_claims": 1,
             "fabricated_claims": [],
+            "normalized_hallucination": 0.0,
         }
 
 
@@ -202,12 +160,19 @@ Respond with ONLY this JSON object, no other text before or after:
 {"groundedness_score": 0.8, "unsupported_fraction": 0.2}"""
 
 
-def _judge_groundedness(source_text: str, answer: str) -> dict[str, Any]:
+def _judge_groundedness(
+    source_text: str, answer: str, model: str = "qwen2.5:7b"
+) -> dict[str, Any]:
     user_msg = (
         f"ORIGINAL SOURCE TEXT:\n{source_text}\n\n"
         f"ANSWER TO EVALUATE:\n{answer}"
     )
-    raw = _call_api(system=GROUNDEDNESS_JUDGE_PROMPT, user_message=user_msg)
+    raw = call_llm(
+        system=GROUNDEDNESS_JUDGE_PROMPT,
+        user_message=user_msg,
+        model=model,
+        json_mode=True,
+    )
     try:
         result = _parse_json_response(raw)
         return {
@@ -264,14 +229,49 @@ def _detected_abstention(answer: str) -> bool:
 
 
 # ===================================================================
+# 5. BOOTSTRAP CONFIDENCE INTERVALS
+# ===================================================================
+
+
+def bootstrap_ci(
+    values: list[float],
+    n_bootstrap: int = 1000,
+    ci: float = 0.95,
+) -> dict[str, float]:
+    """Compute bootstrap confidence interval for a metric.
+
+    Returns
+    -------
+    dict
+        {"mean": float, "ci_low": float, "ci_high": float, "std": float}
+    """
+    if not values:
+        return {"mean": 0.0, "ci_low": 0.0, "ci_high": 0.0, "std": 0.0}
+
+    arr = np.array(values)
+    rng = np.random.default_rng(42)
+    boot_means = np.array([
+        rng.choice(arr, size=len(arr), replace=True).mean()
+        for _ in range(n_bootstrap)
+    ])
+
+    alpha = (1 - ci) / 2
+    return {
+        "mean": round(float(arr.mean()), 4),
+        "ci_low": round(float(np.percentile(boot_means, alpha * 100)), 4),
+        "ci_high": round(float(np.percentile(boot_means, (1 - alpha) * 100)), 4),
+        "std": round(float(boot_means.std()), 4),
+    }
+
+
+# ===================================================================
 # Public metric functions
 # ===================================================================
 
 
 def calculate_accuracy(
-    results: list[dict[str, Any]], agent_type: str
+    results: list[dict[str, Any]], agent_type: str, model: str = "qwen2.5:7b"
 ) -> float:
-    """Semantic accuracy via LLM judge. Only scored on answerable samples."""
     answerable = [r for r in results if r.get("answerable", True)]
     if not answerable:
         return 0.0
@@ -280,7 +280,7 @@ def calculate_accuracy(
     for entry in answerable:
         prediction = entry.get(f"{agent_type}_answer", "")
         ground_truth = entry.get("ground_truth", "")
-        is_ok = _judge_correct(prediction, ground_truth)
+        is_ok = _judge_correct(prediction, ground_truth, model=model)
         entry[f"{agent_type}_correct"] = is_ok
         if is_ok:
             correct += 1
@@ -300,7 +300,6 @@ def calculate_accuracy(
 def calculate_ece(
     results: list[dict[str, Any]], agent_type: str, n_bins: int = 10
 ) -> float:
-    """Expected Calibration Error. Only on answerable samples."""
     answerable = [
         r for r in results
         if r.get("answerable", True) and r.get(f"{agent_type}_correct") is not None
@@ -338,36 +337,47 @@ def calculate_ece(
 
 
 def calculate_hallucination(
-    results: list[dict[str, Any]], agent_type: str
+    results: list[dict[str, Any]], agent_type: str, model: str = "qwen2.5:7b"
 ) -> dict[str, Any]:
-    """Hallucination rate and severity across all samples."""
     if not results:
-        return {"hallucination_rate": 0.0, "avg_severity": 0.0}
+        return {
+            "hallucination_rate": 0.0,
+            "avg_severity": 0.0,
+            "normalized_hallucination": 0.0,
+        }
 
     detections = 0
     severities: list[float] = []
+    normalized_scores: list[float] = []
+
     for entry in results:
         source = entry.get("raw_text", "")
         answer = entry.get(f"{agent_type}_answer", "")
-        result = _judge_hallucination(source, answer)
+        result = _judge_hallucination(source, answer, model=model)
         entry[f"{agent_type}_hallucination"] = result
         if result["hallucination_detected"]:
             detections += 1
         severities.append(result["hallucination_severity"])
+        normalized_scores.append(result["normalized_hallucination"])
 
     rate = detections / len(results)
     avg_sev = float(np.mean(severities))
+    avg_norm = float(np.mean(normalized_scores))
+
     logger.info(
-        "Hallucination (%s): rate=%.2f, avg_severity=%.4f",
-        agent_type, rate, avg_sev,
+        "Hallucination (%s): rate=%.2f, severity=%.4f, normalized=%.4f",
+        agent_type, rate, avg_sev, avg_norm,
     )
-    return {"hallucination_rate": round(rate, 4), "avg_severity": round(avg_sev, 4)}
+    return {
+        "hallucination_rate": round(rate, 4),
+        "avg_severity": round(avg_sev, 4),
+        "normalized_hallucination": round(avg_norm, 4),
+    }
 
 
 def calculate_groundedness(
-    results: list[dict[str, Any]], agent_type: str
+    results: list[dict[str, Any]], agent_type: str, model: str = "qwen2.5:7b"
 ) -> dict[str, Any]:
-    """Average groundedness score across all samples."""
     if not results:
         return {"avg_groundedness": 0.0, "avg_unsupported_fraction": 0.0}
 
@@ -376,7 +386,7 @@ def calculate_groundedness(
     for entry in results:
         source = entry.get("raw_text", "")
         answer = entry.get(f"{agent_type}_answer", "")
-        result = _judge_groundedness(source, answer)
+        result = _judge_groundedness(source, answer, model=model)
         entry[f"{agent_type}_groundedness"] = result
         scores.append(result["groundedness_score"])
         unsupported.append(result["unsupported_fraction"])
@@ -393,7 +403,6 @@ def calculate_groundedness(
 def calculate_abstention(
     results: list[dict[str, Any]], agent_type: str
 ) -> dict[str, Any]:
-    """Abstention precision, recall, F1 on unanswerable samples."""
     tp = fp = fn = tn = 0
     for entry in results:
         answerable = entry.get("answerable", True)
@@ -437,14 +446,32 @@ def calculate_abstention(
 # ===================================================================
 
 
-def calculate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Calculate all metrics for both agent types."""
+def calculate_metrics(
+    results: list[dict[str, Any]],
+    pipelines: list[str] | None = None,
+    model: str = "qwen2.5:7b",
+) -> dict[str, Any]:
+    """Calculate all metrics for specified pipeline formats.
+
+    Parameters
+    ----------
+    results : list[dict]
+        Per-sample evaluation rows.
+    pipelines : list[str] | None
+        List of format names to evaluate (e.g. ["json", "skn"]).
+        Defaults to ["json", "skn"].
+    model : str
+        Ollama model for LLM-as-judge calls.
+    """
+    if pipelines is None:
+        pipelines = ["json", "skn"]
+
     metrics: dict[str, Any] = {}
 
-    for fmt in ("json", "skn"):
+    for fmt in pipelines:
         logger.info("========== Evaluating: %s format ==========", fmt)
 
-        acc = calculate_accuracy(results, fmt)
+        acc = calculate_accuracy(results, fmt, model=model)
         ece = calculate_ece(results, fmt)
 
         answerable = [r for r in results if r.get("answerable", True)]
@@ -460,12 +487,27 @@ def calculate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
             if r.get(f"{fmt}_correct") is False
         ]
 
-        hall = calculate_hallucination(results, fmt)
-        grnd = calculate_groundedness(results, fmt)
+        hall = calculate_hallucination(results, fmt, model=model)
+        grnd = calculate_groundedness(results, fmt, model=model)
         abst = calculate_abstention(results, fmt)
+
+        # Per-sample accuracy for bootstrap
+        per_sample_acc = [
+            1.0 if r.get(f"{fmt}_correct", False) else 0.0
+            for r in answerable
+        ]
+        per_sample_hall = [
+            r.get(f"{fmt}_hallucination", {}).get("normalized_hallucination", 0.0)
+            for r in results
+        ]
+        per_sample_grnd = [
+            r.get(f"{fmt}_groundedness", {}).get("groundedness_score", 0.0)
+            for r in results
+        ]
 
         metrics[fmt] = {
             "accuracy": round(acc, 4),
+            "accuracy_ci": bootstrap_ci(per_sample_acc),
             "ece": round(ece, 4),
             "avg_confidence": round(
                 float(np.mean(confidences)) if confidences else 0.0, 4
@@ -478,7 +520,10 @@ def calculate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
             ),
             "hallucination_rate": hall["hallucination_rate"],
             "hallucination_severity": hall["avg_severity"],
+            "normalized_hallucination": hall["normalized_hallucination"],
+            "normalized_hallucination_ci": bootstrap_ci(per_sample_hall),
             "groundedness": grnd["avg_groundedness"],
+            "groundedness_ci": bootstrap_ci(per_sample_grnd),
             "unsupported_fraction": grnd["avg_unsupported_fraction"],
             "abstention_precision": abst["precision"],
             "abstention_recall": abst["recall"],

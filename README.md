@@ -9,6 +9,21 @@ Current AI pipelines extract information from web search results into **JSON** b
 **Structured Knowledge Notation (SKN)** is a drop-in replacement for JSON at the extraction layer. It encodes confidence, causality, gaps, and risk inline using a token-efficient notation. This benchmark isolates the extraction format as the single variable and measures its downstream impact on agent reasoning.
 
 
+## What Changed (v2)
+
+| Feature | v1 | v2 |
+|---------|----|----|
+| LLM Provider | Anthropic Claude API (paid) | **Ollama (local, free)** |
+| Default Model | `claude-sonnet-4-20250514` | **`qwen2.5:7b`** |
+| Dataset Size | 15 samples | **50 samples** |
+| Categories | 6 | **7** (added `multi_step`) |
+| Extraction Variants | 2 (JSON, SKN) | **6** (ablation study) |
+| Hallucination Metric | Binary detection only | **Normalized (fabricated/total claims)** |
+| Statistical Rigor | Point estimates | **Bootstrap 95% confidence intervals** |
+| Code Duplication | 3 files with copy-pasted API client | **Shared `llm.py` module** |
+| API Key Required | Yes | **No** |
+
+
 ## Architecture
 
 ```
@@ -20,185 +35,89 @@ Current AI pipelines extract information from web search results into **JSON** b
                                              |
                                 same raw search results
                                              |
-                          +------------------+------------------+
-                          |                                     |
-                          v                                     v
-               PIPELINE A (Baseline)               PIPELINE B (Proposed)
-            +----------------------+            +----------------------+
-            |  extract_json()      |            |  extract_skn()       |
-            |  entities/relations  |            |  @facts @causal      |
-            |  claims (flat)       |            |  @gaps @risk         |
-            +----------+-----------+            +----------+-----------+
-                       |                                   |
-                       v                                   v
-            agent_reason(json, q)              agent_reason(skn, q)
-                       |                                   |
-                       +-----------------+-----------------+
-                                         |
-                                         v
-                                +----------------+
-                                |   Evaluation   |
-                                |   (5 metrics)  |
-                                +----------------+
-
-  Same search. Same agent. Same evaluator. Only the extraction format changes.
+              +----------+----------+----------+----------+----------+
+              |          |          |          |          |          |
+              v          v          v          v          v          v
+          json       json_conf  skn_no_gaps skn_no_causal skn_no_risk  skn
+        (baseline)  (+ confidence) (- @gaps) (- @causal)  (- @risk)  (full)
+              |          |          |          |          |          |
+              v          v          v          v          v          v
+            Same agent_reason() for all  -->  Same evaluator for all
 ```
+
+Default mode runs 2 pipelines (JSON vs full SKN). Ablation mode runs all 6.
 
 ### Execution Phases
 
-| Phase | What Happens | Calls per Sample |
-|-------|-------------|-----------------|
-| 1. Search | `search_web(question)` via DuckDuckGo | 1 HTTP |
-| 2. Extraction | `extract_json(raw)` and `extract_skn(raw)` on same search results | 2 LLM |
-| 3. Reasoning | `agent_reason(json_ctx, q)` and `agent_reason(skn_ctx, q)` | 2 LLM |
-| 4. Evaluation | Accuracy, hallucination, groundedness judges + ECE + abstention | 6 LLM |
+| Phase | What Happens | Calls per Sample (default) | Calls per Sample (ablation) |
+|-------|-------------|---------------------------|----------------------------|
+| 1. Search | `search_web(question)` via DuckDuckGo | 1 HTTP | 1 HTTP |
+| 2. Extraction | Extract using each pipeline variant | 2 LLM | 6 LLM |
+| 3. Reasoning | `agent_reason(context, q)` per variant | 2 LLM | 6 LLM |
+| 4. Evaluation | Accuracy, hallucination, groundedness judges + ECE + abstention | 6 LLM | 18 LLM |
 
-Total: ~11 calls per sample. 15 samples = ~165 API calls.
+Default: ~11 calls/sample x 50 samples = ~550 local LLM calls.
+Ablation: ~31 calls/sample x 50 samples = ~1,550 local LLM calls.
 
 
-## Results
+## Ablation Study
 
-Benchmark run on 15 samples using `claude-sonnet-4-20250514` with temperature 0. Total runtime: 721.3 seconds.
+The ablation isolates which SKN component drives the accuracy improvement. Without this, someone could argue "SKN wins because it carries more information, not because of its format."
 
-### Head-to-Head Comparison
+| Variant | What It Tests |
+|---------|--------------|
+| `json` | Baseline: flat entities/relationships/claims, no metadata |
+| `json_conf` | JSON + per-claim confidence scores (tests: does adding confidence to JSON close the gap?) |
+| `skn_no_gaps` | Full SKN minus `@gaps` (tests: how much does explicit gap listing matter?) |
+| `skn_no_causal` | Full SKN minus `@causal` (tests: do causal chains help or hurt?) |
+| `skn_no_risk` | Full SKN minus `@risk` (tests: does misdirection signaling matter?) |
+| `skn` | Full SKN with all sections (proposed format) |
+
+Run with:
+```bash
+python -m src.benchmark --ablation
+```
+
+
+## New Metrics
+
+### Normalized Hallucination Rate
+
+The raw hallucination detection rate penalizes longer answers. A 10-sentence answer has more surface area for hallucination flags than a 3-sentence answer.
+
+The normalized metric fixes this:
+```
+normalized_hallucination = fabricated_claims_count / total_claims_count
+```
+
+This measures hallucination density rather than presence, making comparisons fairer across formats that produce different answer lengths.
+
+### Bootstrap Confidence Intervals
+
+All key metrics now include 95% bootstrap confidence intervals (1000 resamples, seed 42). This answers: "Could this result be due to chance?"
+
+```
+Accuracy: 0.85 (95% CI: [0.78, 0.92])
+```
+
+If the confidence intervals for two formats overlap, the difference is not statistically meaningful.
+
+
+## Previous Results (Claude Sonnet 4, n=15)
+
+These results were obtained with `claude-sonnet-4-20250514` on the original 15-sample dataset. They demonstrate the format's potential but should be interpreted with the caveats noted in Limitations.
 
 | Metric | JSON | SKN | Winner | Delta |
 |--------|------|-----|--------|-------|
-| **Accuracy** | 75.0% (9/12) | **100.0%** (12/12) | SKN | +25.0 pp |
+| **Accuracy** | 75.0% | **100.0%** | SKN | +25.0 pp |
 | **ECE (calibration)** | **0.1867** | 0.2325 | JSON | +0.046 |
 | **Hallucination rate** | **40.0%** | 60.0% | JSON | +20.0 pp |
-| **Hallucination severity** | **0.200** | 0.247 | JSON | +0.047 |
 | **Groundedness** | **0.750** | 0.727 | JSON | -0.023 |
-| **Unsupported fraction** | **25.0%** | 27.3% | JSON | +2.3 pp |
 | **Abstention F1** | 0.857 | **1.000** | SKN | +0.143 |
 | **Avg context tokens** | 686 | **273** | SKN | 2.5x fewer |
-| **Avg extraction time** | 10.52s | **7.61s** | SKN | 28% faster |
 | **Avg total latency** | 19.39s | **15.86s** | SKN | 18% faster |
 
-**Verdict: JSON wins 3/5 evaluation dimensions, SKN wins 2/5.**
-
-But the picture is more nuanced than a simple tally. Read on.
-
-
-### Confidence Breakdown
-
-| Metric | JSON | SKN |
-|--------|------|-----|
-| Average confidence (answerable) | 0.813 | 0.768 |
-| Confidence when correct | 0.890 | 0.768 |
-| Confidence when wrong | 0.583 | 0.000 |
-
-SKN never returned a wrong answer in this run, so `confidence_when_wrong` is 0.0 by default. JSON's confidence when wrong (0.583) reveals overconfidence on incorrect answers, a dangerous property in production systems where high confidence on wrong answers can propagate errors downstream.
-
-
-### Abstention Detail
-
-| Metric | JSON | SKN |
-|--------|------|-----|
-| Precision | 0.75 | **1.00** |
-| Recall | 1.00 | 1.00 |
-| F1 | 0.857 | **1.000** |
-| True Positives | 3 | 3 |
-| False Positives | 1 | 0 |
-| False Negatives | 0 | 0 |
-| True Negatives | 9 | 12 |
-
-Both pipelines correctly refused all 3 unanswerable questions (samples 11-13). The difference: JSON produced 1 false positive (sample 8, FastAPI/502 question), where it hedged with "I cannot definitively explain" despite the question being answerable. SKN answered the same question directly and was judged correct. The `@gaps` section in SKN gave the agent explicit signal about what was missing vs what was present, enabling it to commit to an answer rather than hedge.
-
-
-### Token Efficiency
-
-| Metric | JSON | SKN | Ratio |
-|--------|------|-----|-------|
-| Avg context tokens | 686 | 273 | SKN uses **60% fewer tokens** |
-| Token ratio (SKN/JSON) | 1.0x (baseline) | 0.4x | **2.5x compression** |
-
-SKN achieves this compression by replacing verbose JSON keys (`"entities"`, `"relationships"`, `"claims"`) with single-character symbols (`!`, `.`, `~`, `->`) and structured section headers (`@facts`, `@causal`, `@gaps`). The token savings compound at scale: a 1000-query workload would save ~413,000 context tokens.
-
-
-## Tradeoff Analysis
-
-The results reveal a fundamental tension between two properties:
-
-### Where SKN Wins: Reasoning Quality
-
-**Accuracy (+25 pp):** SKN achieved perfect accuracy (12/12) vs JSON's 75% (9/12). The three questions JSON got wrong were:
-
-| Sample | Category | Question | JSON Got Wrong Because |
-|--------|----------|----------|----------------------|
-| 8 | diagnostic | FastAPI 502 under load | JSON hedged ("cannot definitively explain") instead of answering. SKN's `@gaps` section explicitly listed what was missing, so the agent could distinguish between "I have enough to answer" vs "I truly cannot answer." |
-| 10 | diagnostic | JWT 401 after key rotation | JSON latched onto `ignoreNotBefore` (a tangential detail from search results) and built an incorrect explanation around it. SKN's per-claim confidence scores (`[0.65]`) flagged this as uncertain, steering the agent toward a more cautious but correct synthesis. |
-| 14 | ambiguous | Monolith vs microservices | JSON gave a one-sided recommendation ("should consider migrating"). SKN presented both sides because `@risk misdirection:medium` signaled the question was inherently ambiguous, prompting the agent to acknowledge tradeoffs. |
-
-The pattern: SKN's epistemic metadata (confidence scores, gap lists, risk signals) gave the reasoning agent better signal for deciding when to commit, when to hedge, and when to present nuance.
-
-**Abstention F1 (+0.143):** SKN's `@gaps` section creates a clear boundary between "the source lacks this specific info" and "the source has relevant info but it's incomplete." This distinction prevented the false positive that JSON produced on sample 8.
-
-### Where JSON Wins: Faithfulness to Source
-
-**Hallucination rate (-20 pp):** JSON answers hallucinated in 40% of samples vs SKN's 60%. This is the most significant concern with SKN. The likely mechanism: SKN's causal chains (`@causal` section with `->` operators) encourage the agent to construct explanatory narratives. When the search results contain partial information, the agent fills gaps in the causal chain with plausible but unsupported inferences.
-
-Example from sample 4 (CI/CD optimization):
-- JSON answer: listed optimization techniques directly from search results (no hallucination)
-- SKN answer: added "Use GitHub Actions' matrix builds to run tests in parallel" and "Use workflow artifacts to share build outputs" -- plausible recommendations not present in the search results
-
-The causal structure in SKN acts as a double-edged sword: it improves reasoning quality but also provides a scaffold for the agent to fill in with fabricated details.
-
-**Groundedness (-0.023):** A small gap, but directionally consistent with the hallucination finding. JSON answers stay closer to the source text. SKN answers are more interpretive, which helps accuracy but hurts literal groundedness.
-
-**ECE / Calibration (+0.046):** JSON's confidence scores are better calibrated (closer to actual accuracy). SKN's slightly worse calibration comes from an interesting asymmetry: SKN answers tend to be more conservative in confidence (avg 0.768 vs 0.813) but more accurate (100% vs 75%), meaning SKN is slightly underconfident rather than overconfident. In practice, underconfidence is safer than overconfidence.
-
-### The Efficiency Advantage
-
-SKN's 2.5x token reduction and 18% latency improvement are unambiguous wins that do not trade off against any quality dimension. These savings come purely from the notation's compactness, not from information loss. The same facts, relationships, and claims are present in both formats; SKN simply represents them with fewer tokens.
-
-At scale, this matters:
-
-| Scale | JSON Tokens | SKN Tokens | Savings |
-|-------|------------|------------|---------|
-| 100 queries | 68,600 | 27,300 | 41,300 tokens |
-| 1,000 queries | 686,000 | 273,000 | 413,000 tokens |
-| 10,000 queries | 6,860,000 | 2,730,000 | 4,130,000 tokens |
-
-
-### Summary: When to Use Which
-
-| Use Case | Recommended Format | Rationale |
-|----------|-------------------|-----------|
-| High-stakes decisions where accuracy matters most | **SKN** | 100% vs 75% accuracy; epistemic metadata prevents reasoning errors |
-| Applications requiring strict source faithfulness | **JSON** | Lower hallucination rate; answers stay closer to source text |
-| Cost-sensitive or latency-sensitive deployments | **SKN** | 2.5x fewer tokens, 18% faster end-to-end |
-| Systems that must know when to refuse | **SKN** | Perfect abstention (F1=1.0); no false positives |
-| Regulatory contexts requiring auditability | **JSON** | Higher groundedness; easier to trace claims back to sources |
-| General-purpose question answering | **SKN** | Accuracy and efficiency advantages outweigh hallucination risk for most use cases |
-
-
-## Per-Sample Results
-
-### Answerable Samples (12)
-
-| ID | Category | Question (abbreviated) | JSON | SKN | Notes |
-|----|----------|----------------------|------|-----|-------|
-| 1 | diagnostic | Pandas MemoryError large CSV | Correct | Correct | Both identified chunking/RAM issue |
-| 2 | diagnostic | Jackson empty body, Lombok getter | Correct | Correct | Both traced to missing @Getter |
-| 3 | diagnostic | K8s pod eviction, memory leak | Correct | Correct | Both identified unbounded queue |
-| 4 | optimization | Slow CI/CD monorepo | Correct | Correct | SKN hallucinated extra details |
-| 5 | diagnostic | React Query stale data | Correct | Correct | Both identified invalidateQueries |
-| 6 | optimization | SQL composite index | Correct | Correct | Both got (customer_id, status, created_at) |
-| 7 | architecture | Split-brain, leader election | Correct | Correct | Both identified network partition cause |
-| 8 | diagnostic | FastAPI 502 under load | **Wrong** | Correct | JSON hedged; SKN answered directly |
-| 9 | diagnostic | Git repo size, large binaries | Correct | Correct | Both recommended filter-repo + LFS |
-| 10 | diagnostic | JWT 401 after key rotation | **Wrong** | Correct | JSON fixated on ignoreNotBefore |
-| 14 | ambiguous | Monolith vs microservices | **Wrong** | Correct | JSON one-sided; SKN presented tradeoffs |
-| 15 | misleading | MongoDB vs PostgreSQL (O(n^2)) | Correct | Correct | Both correctly identified algorithm as root cause |
-
-### Unanswerable Samples (3)
-
-| ID | Category | Question (abbreviated) | JSON Abstained | SKN Abstained |
-|----|----------|----------------------|----------------|---------------|
-| 11 | insufficient_info | Acme Corp internal outage | Yes | Yes |
-| 12 | insufficient_info | Project Zebra-9 build failure | Yes | Yes |
-| 13 | insufficient_info | Proprietary ML dataset regression | Yes | Yes |
+Run the benchmark with your local Ollama model to generate fresh results on the expanded 50-sample dataset.
 
 
 ## SKN Format Specification
@@ -243,18 +162,6 @@ At scale, this matters:
 | `@risk` | Misdirection and missing context risk assessment |
 
 
-## JSON vs SKN Comparison
-
-| Capability | JSON | SKN |
-|-----------|------|-----|
-| Per-claim confidence scores | No | Yes, inline `[0.0-1.0]` |
-| Fact priority ordering | No (flat array) | Yes (`!` > `.` > `~`) |
-| Causal chains with strength | No (unlabeled edges) | Yes (`->` with `[strength]`) |
-| Explicit knowledge gaps | Not representable | Yes (`@gaps` section) |
-| Misdirection risk signal | Not representable | Yes (`@risk` line) |
-| Token efficiency | ~686 tokens | ~273 tokens |
-
-
 ## Evaluation Metrics
 
 ### 1. Accuracy
@@ -262,6 +169,7 @@ LLM judge compares agent answer to ground truth semantically. Scored on answerab
 
 ```
 Metric: correct_count / answerable_count
+With 95% bootstrap CI.
 ```
 
 ### 2. Expected Calibration Error (ECE)
@@ -272,12 +180,13 @@ ECE = sum over bins: (bin_size / total) * |accuracy_in_bin - avg_confidence_in_b
 Lower is better. 0.0 = perfectly calibrated.
 ```
 
-### 3. Hallucination Rate
+### 3. Hallucination Rate + Normalized Hallucination
 LLM judge checks each answer against search results for fabricated claims.
 
 ```
-Returns: {hallucination_detected: bool, hallucination_severity: 0.0-1.0}
-Metrics: detection_rate (lower is better), avg_severity (lower is better)
+Returns: {hallucination_detected: bool, hallucination_severity: 0.0-1.0, total_claims: int, fabricated_claims: [...]}
+Metrics: detection_rate, avg_severity, normalized_hallucination (fabricated/total)
+With 95% bootstrap CI on normalized metric.
 ```
 
 ### 4. Groundedness
@@ -286,6 +195,7 @@ LLM judge scores how well the answer is traceable to the search results.
 ```
 Returns: {groundedness_score: 0.0-1.0, unsupported_fraction: 0.0-1.0}
 Metrics: avg_groundedness (higher is better), avg_unsupported (lower is better)
+With 95% bootstrap CI.
 ```
 
 ### 5. Abstention
@@ -296,7 +206,7 @@ Metrics: precision, recall, F1 (higher is better)
 ```
 
 ### 6. Token Efficiency
-Estimated token count of extraction output and end-to-end latency including search time.
+Estimated token count of extraction output and end-to-end latency.
 
 ```
 Metrics: avg_context_tokens, avg_search_time_s, avg_extraction_time_s, avg_total_latency_s
@@ -308,81 +218,91 @@ Metrics: avg_context_tokens, avg_search_time_s, avg_extraction_time_s, avg_total
 ```
 csb-benchmark/
 +-- data/
-|   +-- samples.json            # 15 questions (question + ground_truth, no raw_text)
+|   +-- samples.json            # 50 questions across 7 categories
 +-- src/
 |   +-- __init__.py
+|   +-- llm.py                  # Shared Ollama client (all modules import from here)
 |   +-- searcher.py             # search_web(query) via DuckDuckGo
-|   +-- extractors.py           # extract_json(), extract_skn()
-|   +-- agent.py                # agent_reason(context, question) -> {answer, confidence, reasoning}
-|   +-- evaluator.py            # LLM judges + ECE + abstention detector
-|   +-- benchmark.py            # 4-phase orchestrator (search, extract, reason, evaluate)
+|   +-- extractors.py           # 6 extraction variants + registry
+|   +-- agent.py                # agent_reason(context, question)
+|   +-- evaluator.py            # LLM judges + ECE + abstention + bootstrap CI
+|   +-- benchmark.py            # 4-phase orchestrator with ablation support
 +-- results/                    # Generated after benchmark run
-|   +-- search_results.json     # Raw search output per question
-|   +-- extractions.json        # JSON and SKN extraction outputs
-|   +-- agent_responses.json    # Agent answers for both formats
-|   +-- detailed_results.json   # Per-sample evaluation scores
-|   +-- metrics.json            # Aggregated metrics across all dimensions
-|   +-- summary.txt             # Human-readable comparison with verdict
+|   +-- search_results.json
+|   +-- extractions.json
+|   +-- agent_responses.json
+|   +-- detailed_results.json
+|   +-- metrics.json            # Includes bootstrap CIs and normalized hallucination
+|   +-- summary.txt
 +-- .env.example
 +-- requirements.txt
 +-- README.md
++-- LICENSE
 ```
 
 ### Module API
 
+**llm.py**
+```python
+def call_llm(system: str, user_message: str, model: str = "qwen2.5:7b",
+             json_mode: bool = False) -> str
+```
+
 **searcher.py**
 ```python
 def search_web(query: str, num_results: int = 5) -> str
-# Returns: concatenated search result text (titles, snippets, URLs)
 ```
 
 **extractors.py**
 ```python
-def extract_json(raw_text: str, model: str = "claude-sonnet-4-20250514") -> dict[str, Any]
-def extract_skn(raw_text: str, model: str = "claude-sonnet-4-20250514") -> str
+def extract_json(raw_text: str, model: str = "qwen2.5:7b") -> dict[str, Any]
+def extract_json_conf(raw_text: str, model: str = "qwen2.5:7b") -> dict[str, Any]
+def extract_skn(raw_text: str, model: str = "qwen2.5:7b") -> str
+def extract_skn_no_gaps(raw_text: str, model: str = "qwen2.5:7b") -> str
+def extract_skn_no_causal(raw_text: str, model: str = "qwen2.5:7b") -> str
+def extract_skn_no_risk(raw_text: str, model: str = "qwen2.5:7b") -> str
+
+EXTRACTORS: dict[str, Callable]       # name -> function registry
+DEFAULT_PIPELINES = ["json", "skn"]
+ABLATION_PIPELINES = ["json", "json_conf", "skn_no_gaps", "skn_no_causal", "skn_no_risk", "skn"]
 ```
 
 **agent.py**
 ```python
-def agent_reason(context: str | dict, question: str, model: str = "claude-sonnet-4-20250514") -> dict[str, Any]
+def agent_reason(context: str | dict, question: str, model: str = "qwen2.5:7b") -> dict[str, Any]
 # Returns: {"answer": str, "confidence": float, "reasoning": str}
 ```
 
 **evaluator.py**
 ```python
-def calculate_metrics(results: list[dict]) -> dict[str, Any]
-# Returns: {"json": {...metrics}, "skn": {...metrics}}
+def calculate_metrics(results: list[dict], pipelines: list[str] = None, model: str = "qwen2.5:7b") -> dict[str, Any]
+def bootstrap_ci(values: list[float], n_bootstrap: int = 1000, ci: float = 0.95) -> dict[str, float]
+# Returns per pipeline: accuracy, accuracy_ci, ece, hallucination_rate, normalized_hallucination,
+#   normalized_hallucination_ci, groundedness, groundedness_ci, abstention_f1, ...
 ```
 
 **benchmark.py**
 ```python
-def run_benchmark(dataset_path: str, output_dir: str = "results", model: str = "claude-sonnet-4-20250514") -> dict[str, Any]
+def run_benchmark(dataset_path: str, output_dir: str = "results",
+                  model: str = "qwen2.5:7b", ablation: bool = False) -> dict[str, Any]
 ```
 
 
 ## Dataset
 
-15 samples across 6 categories. No raw_text provided. The system searches the internet live for each question.
+50 samples across 7 categories. No raw_text provided. The system searches the internet live for each question.
 
 | Category | Count | Purpose |
 |----------|-------|---------|
-| `diagnostic` | 7 | Root cause analysis questions searchable online |
-| `optimization` | 2 | Performance tuning with known best practices |
-| `architecture` | 1 | Distributed systems design question |
-| `insufficient_info` | 3 | Questions about fictitious internal systems (no online info exists) |
-| `ambiguous` | 1 | Multiple valid answers (tests nuanced reasoning) |
-| `misleading` | 1 | Question implies wrong root cause (tests misdirection resistance) |
+| `diagnostic` | 15 | Root cause analysis questions searchable online |
+| `optimization` | 7 | Performance tuning with known best practices |
+| `architecture` | 5 | Distributed systems design questions |
+| `insufficient_info` | 8 | Questions about fictitious internal systems (no online info exists) |
+| `ambiguous` | 5 | Multiple valid answers (tests nuanced reasoning) |
+| `misleading` | 5 | Question implies wrong root cause (tests misdirection resistance) |
+| `multi_step` | 5 | Debugging requiring chaining 2-3 pieces of information |
 
-Each sample:
-```json
-{
-  "id": 1,
-  "category": "diagnostic",
-  "question": "What causes Python MemoryError when loading large CSV files with pandas read_csv?",
-  "ground_truth": "Loading the entire file into memory at once without chunking exceeds available RAM",
-  "answerable": true
-}
-```
+Technologies covered: Python, Java, Go, Rust, TypeScript, Node.js, Docker, Kubernetes, PostgreSQL, Redis, Elasticsearch, Kafka, RabbitMQ, Terraform, AWS Lambda, gRPC.
 
 
 ## Setup
@@ -394,120 +314,85 @@ git clone https://github.com/ujjwalredd/Structured-Knowledge-Notation.git
 cd Structured-Knowledge-Notation
 ```
 
-### 2. Install dependencies
+### 2. Install Ollama
+
+```bash
+# macOS
+brew install ollama
+
+# Linux
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+### 3. Pull the model
+
+```bash
+ollama pull qwen2.5:7b
+```
+
+Other recommended models:
+| Model | VRAM | Quality | Speed |
+|-------|------|---------|-------|
+| `qwen2.5:7b` | ~4.7 GB | Good (recommended default) | Fast |
+| `qwen2.5:14b` | ~9 GB | Better | Moderate |
+| `llama3.1:8b` | ~4.7 GB | Good | Fast |
+| `llama3.3:70b` | ~40 GB | Best | Slow |
+
+### 4. Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Anthropic API key
-
-Get a key from [console.anthropic.com](https://console.anthropic.com).
-
-### 4. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and add your Anthropic API key:
-```
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-DuckDuckGo search requires no API key.
+No API key required. DuckDuckGo search and Ollama are both free.
 
 
 ## Running the Benchmark
 
 ```bash
-# default run
+# Default: JSON vs full SKN (50 samples, ~550 local LLM calls)
 python -m src.benchmark
 
-# custom parameters
-python -m src.benchmark --dataset data/samples.json --output results --model claude-sonnet-4-20250514
+# Ablation: all 6 extraction variants (~1,550 local LLM calls)
+python -m src.benchmark --ablation
+
+# Custom model
+python -m src.benchmark --model qwen2.5:14b
+
+# All options
+python -m src.benchmark --dataset data/samples.json --output results --model qwen2.5:7b --ablation
 ```
-
-
-## Output Format
-
-**metrics.json** structure:
-```json
-{
-  "json": {
-    "accuracy": 0.75,
-    "ece": 0.1867,
-    "avg_confidence": 0.8133,
-    "confidence_when_correct": 0.89,
-    "confidence_when_wrong": 0.5833,
-    "hallucination_rate": 0.4,
-    "hallucination_severity": 0.2,
-    "groundedness": 0.75,
-    "unsupported_fraction": 0.25,
-    "abstention_precision": 0.75,
-    "abstention_recall": 1.0,
-    "abstention_f1": 0.8571,
-    "avg_search_time_s": 1.38,
-    "avg_extraction_time_s": 10.52,
-    "avg_reasoning_time_s": 7.49,
-    "avg_total_latency_s": 19.39,
-    "avg_context_tokens": 686
-  },
-  "skn": {
-    "accuracy": 1.0,
-    "ece": 0.2325,
-    "avg_confidence": 0.7675,
-    "confidence_when_correct": 0.7675,
-    "confidence_when_wrong": 0.0,
-    "hallucination_rate": 0.6,
-    "hallucination_severity": 0.2467,
-    "groundedness": 0.7267,
-    "unsupported_fraction": 0.2733,
-    "abstention_precision": 1.0,
-    "abstention_recall": 1.0,
-    "abstention_f1": 1.0,
-    "avg_search_time_s": 1.38,
-    "avg_extraction_time_s": 7.61,
-    "avg_reasoning_time_s": 6.87,
-    "avg_total_latency_s": 15.86,
-    "avg_context_tokens": 273
-  },
-  "efficiency": {
-    "token_ratio_skn_vs_json": 0.4
-  }
-}
-```
-
-**summary.txt** reports a head-to-head verdict across 5 dimensions (accuracy, ECE, hallucination, groundedness, abstention) with the winner of each dimension and an overall count.
 
 
 ## Technical Details
 
 | Parameter | Value |
 |-----------|-------|
-| LLM Provider | Anthropic Claude API |
+| LLM Provider | Ollama (local inference) |
 | Search Provider | DuckDuckGo (via `ddgs` package) |
-| Default Model | `claude-sonnet-4-20250514` |
+| Default Model | `qwen2.5:7b` |
 | Temperature | 0 (deterministic) |
 | Max Tokens | 4096 |
 | Search Results | Top 5 per query |
 | Retry Strategy | Exponential backoff (base 2s, max 3 retries) |
-| Retry Triggers | `RateLimitError`, HTTP 5xx, search API errors |
 | ECE Bins | 10 equal-width bins [0.0, 1.0] |
 | Token Estimation | `len(text) // 4` |
+| Bootstrap Resamples | 1000 (seed 42) |
+| Confidence Level | 95% |
+| JSON Mode | Ollama `format="json"` for structured output |
 
 
 ## Limitations
 
-1. **Small sample size (n=15).** The 25 pp accuracy gap and 20 pp hallucination gap could shift significantly with more samples. These results are directional, not statistically conclusive.
+1. **LLM-as-judge variance.** Accuracy, hallucination, and groundedness are judged by the same model that generates the answers. LLM judges can exhibit systematic biases. Using a separate, larger model as judge would reduce this bias.
 
-2. **Single model.** All results are from `claude-sonnet-4-20250514`. Different models may respond differently to SKN's structured epistemic signals. A model with weaker instruction-following might not leverage `@gaps` and `@risk` as effectively.
+2. **Single model per run.** Results depend heavily on the chosen model. A model with weaker instruction-following might not leverage `@gaps` and `@risk` effectively. Run with multiple models to compare.
 
-3. **LLM-as-judge variance.** Accuracy, hallucination, and groundedness are judged by the same model family. LLM judges can exhibit systematic biases, and using a different judge model might produce different scores.
+3. **Search result volatility.** DuckDuckGo results change over time. Running on different days may produce different search results, affecting all downstream metrics. The `search_results.json` output file preserves the exact results used in each run.
 
-4. **Search result volatility.** DuckDuckGo results change over time. Running the benchmark on a different day may produce different raw search results, affecting all downstream metrics. The `search_results.json` output file preserves the exact results used in each run for reproducibility.
+4. **Token estimation is approximate.** Using `len(text) // 4` is a rough heuristic. Actual tokenization varies by model. The relative comparison (SKN vs JSON) remains directionally valid.
 
-5. **Hallucination measurement.** The hallucination judge flags claims not present in the source text. Some "hallucinated" claims may be correct inferences that the judge conservatively flags as unsupported. The severity scores (0.2-0.3 for most SKN hallucinations) suggest these are minor embellishments rather than severe fabrications.
+5. **Local model quality vs cloud APIs.** Smaller local models (7B-14B parameters) may produce lower absolute scores than cloud models (Claude, GPT-4) but the relative comparison between extraction formats remains meaningful.
 
 
 ## Prior Work and Gap Analysis

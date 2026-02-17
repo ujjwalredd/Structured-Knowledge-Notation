@@ -1,85 +1,22 @@
 """
 Extraction module: JSON vs Structured Knowledge Notation (SKN).
 
-This module sits at the core of the experiment. In a real AI pipeline:
-
-    User Query -> Web Search -> Raw HTML/Text -> EXTRACTION -> Agent -> Answer
-
-Current systems use JSON for the extraction step. This module provides both
-a JSON extractor and a SKN extractor so the downstream agent can be
-benchmarked with each format as its input.
+Provides multiple extraction variants for ablation study:
+  - json:           Flat JSON, no metadata (baseline)
+  - json_conf:      JSON with per-claim confidence scores
+  - skn:            Full SKN (all sections)
+  - skn_no_gaps:    SKN without @gaps section
+  - skn_no_causal:  SKN without @causal section
+  - skn_no_risk:    SKN without @risk section
 """
 
 import json
 import logging
-import os
-import time
 from typing import Any
 
-from anthropic import Anthropic, APIError, RateLimitError
-from dotenv import load_dotenv
-
-load_dotenv()
+from src.llm import call_llm
 
 logger = logging.getLogger(__name__)
-
-_client: Anthropic | None = None
-
-
-def _get_client() -> Anthropic:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise EnvironmentError(
-                "ANTHROPIC_API_KEY not set. "
-                "Create a .env file or export the variable."
-            )
-        _client = Anthropic(api_key=api_key)
-    return _client
-
-
-def _call_api(
-    system: str,
-    user_message: str,
-    model: str,
-    max_retries: int = 3,
-    base_delay: float = 2.0,
-) -> str:
-    client = _get_client()
-    for attempt in range(1, max_retries + 1):
-        try:
-            message = client.messages.create(
-                model=model,
-                max_tokens=4096,
-                temperature=0,
-                system=system,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            return message.content[0].text
-        except RateLimitError:
-            wait = base_delay * (2 ** (attempt - 1))
-            logger.warning(
-                "Rate-limited (attempt %d/%d). Retrying in %.1fs",
-                attempt, max_retries, wait,
-            )
-            if attempt == max_retries:
-                raise
-            time.sleep(wait)
-        except APIError as exc:
-            if exc.status_code and exc.status_code >= 500:
-                wait = base_delay * (2 ** (attempt - 1))
-                logger.warning(
-                    "Server error %s (attempt %d/%d). Retrying in %.1fs",
-                    exc.status_code, attempt, max_retries, wait,
-                )
-                if attempt == max_retries:
-                    raise
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("Exhausted retries without a response")
-
 
 # ---------------------------------------------------------------------------
 # System prompts
@@ -119,6 +56,47 @@ Required Schema:
     {
       "statement": "",
       "category": "fact | statistic | opinion | prediction"
+    }
+  ]
+}
+
+If information is missing, use empty arrays."""
+
+JSON_CONF_SYSTEM_PROMPT = """\
+You are an information extraction engine.
+Your task is to extract structured information from the provided text and output a strict JSON object.
+
+Rules:
+1. Output must be valid JSON.
+2. Do not include explanations.
+3. Do not include markdown.
+4. Do not include comments.
+5. Only include information explicitly supported by the text.
+6. Do not infer unstated causal relationships.
+7. Add a confidence score (0.0-1.0) to each claim based on how strongly the text supports it.
+8. Maintain neutral formatting.
+
+Required Schema:
+{
+  "entities": [
+    {
+      "name": "",
+      "type": "",
+      "attributes": {"key": "value"}
+    }
+  ],
+  "relationships": [
+    {
+      "source": "",
+      "relation": "",
+      "target": ""
+    }
+  ],
+  "claims": [
+    {
+      "statement": "",
+      "category": "fact | statistic | opinion | prediction",
+      "confidence": 0.85
     }
   ]
 }
@@ -169,57 +147,230 @@ Rules:
 7. Every fact must be traceable to the source text.
 8. The @risk line must assess whether the question or text could lead to misdirection."""
 
+SKN_NO_GAPS_PROMPT = """\
+You are a structured knowledge extraction engine optimized for downstream AI reasoning.
+Your task is to convert the provided text into Structured Knowledge Notation (SKN).
+
+Output must follow this exact format. Do not include explanations, markdown, or JSON.
+Do not add any text outside the structure. Be concise. Every token must carry information.
+
+[SKN]
+@src <domain_category> | fresh:<high|medium|low> | reliability:<0.0-1.0>
+
+@facts
+  ! "highest priority fact directly from the text" [<confidence 0.0-1.0>]
+  ! "second highest priority fact" [<confidence>]
+  . "supporting detail" [<confidence>]
+  ~ "uncertain or inferred claim" [<confidence>]
+
+@causal
+  <cause> -> <effect> [<strength 0.0-1.0>]
+
+@risk misdirection:<low|medium|high> | missing_context:<low|medium|high>
+[/SKN]
+
+Symbol key:
+  ! = high importance fact
+  . = supporting detail
+  ~ = uncertain or inferred
+  -> = causal link
+
+Rules:
+1. Confidence scores must reflect only what the text directly supports.
+2. Order facts by importance.
+3. Extract causal links only when the text strongly implies them.
+4. Do NOT include a @gaps section.
+5. Do not fabricate information not grounded in the text.
+6. Keep it compact. Aim for under 200 tokens total.
+7. Every fact must be traceable to the source text.
+8. The @risk line must assess misdirection potential."""
+
+SKN_NO_CAUSAL_PROMPT = """\
+You are a structured knowledge extraction engine optimized for downstream AI reasoning.
+Your task is to convert the provided text into Structured Knowledge Notation (SKN).
+
+Output must follow this exact format. Do not include explanations, markdown, or JSON.
+Do not add any text outside the structure. Be concise. Every token must carry information.
+
+[SKN]
+@src <domain_category> | fresh:<high|medium|low> | reliability:<0.0-1.0>
+
+@facts
+  ! "highest priority fact directly from the text" [<confidence 0.0-1.0>]
+  ! "second highest priority fact" [<confidence>]
+  . "supporting detail" [<confidence>]
+  ~ "uncertain or inferred claim" [<confidence>]
+
+@gaps
+  - <specific information missing from the text>
+
+@risk misdirection:<low|medium|high> | missing_context:<low|medium|high>
+[/SKN]
+
+Symbol key:
+  ! = high importance fact
+  . = supporting detail
+  ~ = uncertain or inferred
+
+Rules:
+1. Confidence scores must reflect only what the text directly supports.
+2. Order facts by importance.
+3. Do NOT include a @causal section. No cause-effect chains.
+4. The @gaps section must list what is NOT in the text.
+5. Do not fabricate information not grounded in the text.
+6. Keep it compact. Aim for under 200 tokens total.
+7. Every fact must be traceable to the source text.
+8. The @risk line must assess misdirection potential."""
+
+SKN_NO_RISK_PROMPT = """\
+You are a structured knowledge extraction engine optimized for downstream AI reasoning.
+Your task is to convert the provided text into Structured Knowledge Notation (SKN).
+
+Output must follow this exact format. Do not include explanations, markdown, or JSON.
+Do not add any text outside the structure. Be concise. Every token must carry information.
+
+[SKN]
+@src <domain_category> | fresh:<high|medium|low> | reliability:<0.0-1.0>
+
+@facts
+  ! "highest priority fact directly from the text" [<confidence 0.0-1.0>]
+  ! "second highest priority fact" [<confidence>]
+  . "supporting detail" [<confidence>]
+  ~ "uncertain or inferred claim" [<confidence>]
+
+@causal
+  <cause> -> <effect> [<strength 0.0-1.0>]
+
+@gaps
+  - <specific information missing from the text>
+[/SKN]
+
+Symbol key:
+  ! = high importance fact
+  . = supporting detail
+  ~ = uncertain or inferred
+  -> = causal link
+
+Rules:
+1. Confidence scores must reflect only what the text directly supports.
+2. Order facts by importance.
+3. Extract causal links only when the text strongly implies them.
+4. The @gaps section must list what is NOT in the text.
+5. Do NOT include a @risk line.
+6. Do not fabricate information not grounded in the text.
+7. Keep it compact. Aim for under 200 tokens total.
+8. Every fact must be traceable to the source text."""
+
 
 # ---------------------------------------------------------------------------
 # Public extraction functions
 # ---------------------------------------------------------------------------
 
-
 def extract_json(
-    raw_text: str, model: str = "claude-sonnet-4-20250514"
+    raw_text: str, model: str = "qwen2.5:7b"
 ) -> dict[str, Any]:
-    """Extract structured JSON from raw text (simulating web search results).
-
-    This is the current industry-standard approach. The raw text is converted
-    to a flat JSON structure with entities, relationships, and claims.
-
-    Returns
-    -------
-    dict
-        Parsed JSON with entities, relationships, and claims.
-    """
+    """Extract structured JSON from raw text (baseline, no metadata)."""
     logger.info("Extracting JSON format (model=%s)", model)
-    raw = _call_api(system=JSON_SYSTEM_PROMPT, user_message=raw_text, model=model)
-
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3].rstrip()
-
+    raw = call_llm(
+        system=JSON_SYSTEM_PROMPT,
+        user_message=raw_text,
+        model=model,
+        json_mode=True,
+    )
     try:
-        parsed: dict[str, Any] = json.loads(cleaned)
+        parsed: dict[str, Any] = json.loads(raw)
     except json.JSONDecodeError as exc:
         logger.error("Failed to parse JSON response: %s", exc)
         parsed = {"entities": [], "relationships": [], "claims": []}
+    return parsed
 
+
+def extract_json_conf(
+    raw_text: str, model: str = "qwen2.5:7b"
+) -> dict[str, Any]:
+    """Extract JSON with per-claim confidence scores (ablation variant)."""
+    logger.info("Extracting JSON+confidence format (model=%s)", model)
+    raw = call_llm(
+        system=JSON_CONF_SYSTEM_PROMPT,
+        user_message=raw_text,
+        model=model,
+        json_mode=True,
+    )
+    try:
+        parsed: dict[str, Any] = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to parse JSON+conf response: %s", exc)
+        parsed = {"entities": [], "relationships": [], "claims": []}
     return parsed
 
 
 def extract_skn(
-    raw_text: str, model: str = "claude-sonnet-4-20250514"
+    raw_text: str, model: str = "qwen2.5:7b"
 ) -> str:
-    """Extract Structured Knowledge Notation from raw text.
-
-    This is the proposed replacement for JSON extraction. The raw text is
-    converted to SKN format carrying inline confidence scores, causal chains,
-    knowledge gaps, and risk assessment.
-
-    Returns
-    -------
-    str
-        SKN-formatted string.
-    """
+    """Extract full SKN (all sections)."""
     logger.info("Extracting SKN format (model=%s)", model)
-    raw = _call_api(system=SKN_SYSTEM_PROMPT, user_message=raw_text, model=model)
-    return raw.strip()
+    raw = call_llm(
+        system=SKN_SYSTEM_PROMPT,
+        user_message=raw_text,
+        model=model,
+    )
+    return raw
+
+
+def extract_skn_no_gaps(
+    raw_text: str, model: str = "qwen2.5:7b"
+) -> str:
+    """Extract SKN without @gaps section (ablation variant)."""
+    logger.info("Extracting SKN-no-gaps format (model=%s)", model)
+    raw = call_llm(
+        system=SKN_NO_GAPS_PROMPT,
+        user_message=raw_text,
+        model=model,
+    )
+    return raw
+
+
+def extract_skn_no_causal(
+    raw_text: str, model: str = "qwen2.5:7b"
+) -> str:
+    """Extract SKN without @causal section (ablation variant)."""
+    logger.info("Extracting SKN-no-causal format (model=%s)", model)
+    raw = call_llm(
+        system=SKN_NO_CAUSAL_PROMPT,
+        user_message=raw_text,
+        model=model,
+    )
+    return raw
+
+
+def extract_skn_no_risk(
+    raw_text: str, model: str = "qwen2.5:7b"
+) -> str:
+    """Extract SKN without @risk line (ablation variant)."""
+    logger.info("Extracting SKN-no-risk format (model=%s)", model)
+    raw = call_llm(
+        system=SKN_NO_RISK_PROMPT,
+        user_message=raw_text,
+        model=model,
+    )
+    return raw
+
+
+# Registry for benchmark.py to iterate over
+EXTRACTORS = {
+    "json": extract_json,
+    "json_conf": extract_json_conf,
+    "skn": extract_skn,
+    "skn_no_gaps": extract_skn_no_gaps,
+    "skn_no_causal": extract_skn_no_causal,
+    "skn_no_risk": extract_skn_no_risk,
+}
+
+# Default pipelines (without ablation)
+DEFAULT_PIPELINES = ["json", "skn"]
+
+# All pipelines (with ablation)
+ABLATION_PIPELINES = [
+    "json", "json_conf",
+    "skn_no_gaps", "skn_no_causal", "skn_no_risk", "skn",
+]

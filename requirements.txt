@@ -1,6 +1,5 @@
-anthropic
+ollama
 python-dotenv
 tqdm
 numpy
-pandas
 ddgs
